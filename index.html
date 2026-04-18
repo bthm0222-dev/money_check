@@ -897,69 +897,85 @@ function doTransfer(){
 }
 
 // ── AI ───────────────────────────────────────────────────
+function getNextPayday(){
+  // 매달 10일, 주말이면 금요일로 당김
+  const today=new Date();
+  let y=today.getFullYear(), m=today.getMonth();
+  // 이번달 10일이 아직 안 지났으면 이번달, 지났으면 다음달
+  if(today.getDate()>10){m++;if(m>11){m=0;y++;}}
+  let payday=new Date(y,m,10);
+  const dow=payday.getDay();
+  if(dow===0)payday=new Date(y,m,8);  // 일요일 → 금요일
+  if(dow===6)payday=new Date(y,m,9);  // 토요일 → 금요일
+  return payday;
+}
+
 function genAILogic(){
-  const cash=totalCash();
-  const due=totalCardDue();
-  const avail=cash-due;
   const hana=accounts.find(a=>a.id==='hana');
   const ok=accounts.find(a=>a.id==='ok');
   const invest=accounts.find(a=>a.type==='invest');
+  const due=totalCardDue();
+  const hanaBalance=hana?hana.balance:0;
+  const realAvail=hanaBalance-due;  // 실 사용 가능: 하나통장 - 카드값
+
   const mt=getMTxns(Y,M);
   const income=mt.filter(t=>t.type==='income').reduce((s,t)=>s+t.amount,0);
-  const expense=mt.filter(t=>t.type==='expense').reduce((s,t)=>s+t.amount,0);
-  const budget=settings.budget||600000;
-  const today=new Date();
-  const daysLeft=new Date(Y,M+1,0).getDate()-today.getDate();
+  // 신용카드 지출 포함한 전체 지출
+  const expense=mt.filter(t=>t.type==='expense'&&t.cat!=='카드결제').reduce((s,t)=>s+t.amount,0);
+  const creditExpense=mt.filter(t=>t.payment==='credit').reduce((s,t)=>s+t.amount,0);
+  const cashExpense=mt.filter(t=>t.type==='expense'&&t.payment!=='credit'&&t.cat!=='카드결제').reduce((s,t)=>s+t.amount,0);
 
-  // Find nearest bill
-  let nearestBill=null, nearestCard=null;
-  cards.forEach(c=>c.bills.forEach(b=>{
-    if(!b.paid){
-      if(!nearestBill||new Date(b.dueDate)<new Date(nearestBill.dueDate)){nearestBill=b;nearestCard=c;}
-    }
-  }));
+  const today=new Date();
+  const payday=getNextPayday();
+  const daysToPayday=Math.ceil((payday-today)/86400000);
+  const dailySafe=daysToPayday>0?Math.floor(Math.max(0,realAvail)/daysToPayday):0;
+
+  // 카테고리별 지출 (신용카드 포함)
+  const catMap={};
+  mt.filter(t=>t.type==='expense'&&t.cat!=='카드결제').forEach(t=>{
+    catMap[t.cat]=(catMap[t.cat]||0)+t.amount;
+  });
+  const topCats=Object.entries(catMap).sort((a,b)=>b[1]-a[1]).slice(0,3);
 
   const lines=[];
   lines.push(`📊 ${Y}년 ${MN[M]} 재무 분석`);
   lines.push('');
 
-  if(avail<0){
-    lines.push(`🚨 위기 상황: 실질 가용 자산이 ${fmt(Math.abs(avail))} 마이너스입니다.`);
-    lines.push(`   현금 합계(${fmt(cash)})보다 카드 결제 예정액(${fmt(due)})이 더 큽니다.`);
-  } else if(avail<100000){
-    lines.push(`⚠️ 주의: 실질 가용 자산이 ${fmt(avail)}로 매우 적습니다.`);
+  // 실 사용 가능 상태
+  if(realAvail<0){
+    lines.push(`🚨 위기: 하나통장(${fmt(hanaBalance)})보다 카드 결제 예정액(${fmt(due)})이 ${fmt(Math.abs(realAvail))} 더 많아요.`);
+    if(ok&&ok.balance>=Math.abs(realAvail))
+      lines.push(`   → OK저축은행에서 최소 ${fmt(Math.abs(realAvail))} 이체 필요`);
+  } else if(realAvail<100000){
+    lines.push(`⚠️ 주의: 실 사용 가능 금액이 ${fmt(realAvail)}로 빠듯해요.`);
   } else {
-    lines.push(`✅ 가용 자산 ${fmt(avail)}로 안정적입니다.`);
+    lines.push(`✅ 실 사용 가능: ${fmt(realAvail)} (하나통장 ${fmt(hanaBalance)} − 카드 결제 ${fmt(due)})`);
   }
   lines.push('');
 
-  if(nearestBill&&hana){
-    const diff=hana.balance-nearestBill.amount;
-    if(diff<0){
-      lines.push(`💳 결제일 경고: ${nearestBill.dueDate}에 ${nearestCard.name} ${fmt(nearestBill.amount)} 결제 예정`);
-      lines.push(`   하나통장 잔액 ${fmt(hana.balance)} → ${fmt(Math.abs(diff))} 부족`);
-      if(ok&&ok.balance>=Math.abs(diff)){
-        lines.push(`   → OK저축은행(${fmt(ok.balance)})에서 최소 ${fmt(Math.abs(diff))} 이체 권장`);
-      }
-      lines.push('');
-    }
-  }
-
-  const dailyLeft=daysLeft>0?Math.floor(Math.max(0,budget-expense)/daysLeft):0;
-  lines.push(`📅 남은 ${daysLeft}일간 하루 권장 지출: ${fmt(dailyLeft)}`);
-  lines.push(`   이번 달 지출: ${fmt(expense)} / 예산 ${fmt(budget)} (${budget?Math.round(expense/budget*100):0}%)`);
+  // 이번달 지출 분석
+  lines.push(`💳 이번 달 지출: ${fmt(expense)}`);
+  lines.push(`   └ 신용카드: ${fmt(creditExpense)} / 현금·이체: ${fmt(cashExpense)}`);
   lines.push('');
 
-  const catMap={};
-  mt.filter(t=>t.type==='expense').forEach(t=>{catMap[t.cat]=(catMap[t.cat]||0)+t.amount});
-  const topCat=Object.entries(catMap).sort((a,b)=>b[1]-a[1])[0];
-  if(topCat)lines.push(`🔍 최다 지출 카테고리: ${topCat[0]} ${fmt(topCat[1])}`);
-
-  if(invest){
-    const investRatio=Math.round(invest.balance/(cash+invest.balance)*100);
-    lines.push(`📈 투자 비중: 전체 자산의 ${investRatio}% (${fmt(invest.balance)})`);
-    if(investRatio>40)lines.push(`   투자 비중이 높습니다. 유동성 확보에 주의하세요.`);
+  // 카테고리별 top 3
+  if(topCats.length){
+    lines.push(`🔍 많이 쓴 카테고리:`);
+    topCats.forEach(([cat,amt],i)=>lines.push(`   ${i+1}. ${cat}: ${fmt(amt)}`));
+    lines.push('');
   }
+
+  // 하루 권장 지출
+  const payStr=`${payday.getMonth()+1}/${payday.getDate()}`;
+  lines.push(`📅 다음 월급일: ${payStr} (${daysToPayday}일 남음)`);
+  lines.push(`   하루 권장 지출: ${fmt(dailySafe)}`);
+  lines.push(`   (실 가용 ${fmt(realAvail)} ÷ ${daysToPayday}일)`);
+  lines.push('');
+
+  // 모은 돈
+  const savings=(ok?ok.balance:0)+(invest?invest.balance:0);
+  lines.push(`💰 모은 돈: ${fmt(savings)}`);
+  lines.push(`   └ OK저축: ${fmt(ok?ok.balance:0)} / 토스증권: ${fmt(invest?invest.balance:0)}`);
 
   return lines.join('\n');
 }
@@ -970,22 +986,43 @@ async function runAI(){
   btn.disabled=true;
   el.textContent='분석 중...';
 
-  const cash=totalCash();
+  const hana=accounts.find(a=>a.id==='hana');
+  const ok=accounts.find(a=>a.id==='ok');
+  const invest=accounts.find(a=>a.type==='invest');
   const due=totalCardDue();
+  const hanaBalance=hana?hana.balance:0;
+  const realAvail=hanaBalance-due;
+
   const mt=getMTxns(Y,M);
   const income=mt.filter(t=>t.type==='income').reduce((s,t)=>s+t.amount,0);
-  const expense=mt.filter(t=>t.type==='expense').reduce((s,t)=>s+t.amount,0);
+  const expense=mt.filter(t=>t.type==='expense'&&t.cat!=='카드결제').reduce((s,t)=>s+t.amount,0);
+  const creditExpense=mt.filter(t=>t.payment==='credit').reduce((s,t)=>s+t.amount,0);
+
   const catMap={};
-  mt.filter(t=>t.type==='expense').forEach(t=>{catMap[t.cat]=(catMap[t.cat]||0)+t.amount});
-  const catStr=Object.entries(catMap).map(([k,v])=>`${k}:${Math.round(v/1000)}천`).join(', ');
+  mt.filter(t=>t.type==='expense'&&t.cat!=='카드결제').forEach(t=>{catMap[t.cat]=(catMap[t.cat]||0)+t.amount});
+  const catStr=Object.entries(catMap).sort((a,b)=>b[1]-a[1]).map(([k,v])=>`${k}:${Math.round(v/1000)}천원`).join(', ');
 
-  const prompt=`나는 대학생 (24살)이야. 현재 재무 상황을 분석해줘.
-현금 자산: ${fmt(cash)}, 카드 결제 예정: ${fmt(due)}, 실질 가용: ${fmt(cash-due)}
-이번 달 수입: ${fmt(income)}, 지출: ${fmt(expense)}, 예산: ${fmt(settings.budget)}
-카테고리별: ${catStr}
-투자 원금: ${fmt((accounts.find(a=>a.type==='invest')||{balance:0}).balance)}
+  const payday=getNextPayday();
+  const daysToPayday=Math.ceil((payday-new Date())/86400000);
+  const savings=(ok?ok.balance:0)+(invest?invest.balance:0);
 
-3~5줄로 핵심만, 한국어로, 솔직하게 조언해줘. 구체적 금액 이동 제안도 포함해줘.`;
+  const prompt=`나는 24살 대학생이야. 아래 내 이번 달 재무 데이터를 분석해줘.
+
+[실 사용 가능 금액]
+하나통장: ${fmt(hanaBalance)}, 카드 결제 예정: ${fmt(due)}, 실 가용: ${fmt(realAvail)}
+
+[이번 달 지출]
+총 지출: ${fmt(expense)} (신용카드: ${fmt(creditExpense)} 포함)
+카테고리별: ${catStr||'없음'}
+이번 달 수입: ${fmt(income)}
+
+[저축 현황]
+모은 돈(OK저축+토스증권): ${fmt(savings)}
+
+[남은 기간]
+다음 월급일까지 ${daysToPayday}일 남음 (매달 10일, 주말이면 금요일)
+
+신용카드 지출을 포함해서 분석해줘. 어디에 가장 많이 썼는지, 하루에 얼마씩 써도 되는지 구체적으로 알려줘. 3~5줄로 핵심만, 한국어로, 솔직하게.`;
 
   try{
     const res=await fetch('https://api.anthropic.com/v1/messages',{
